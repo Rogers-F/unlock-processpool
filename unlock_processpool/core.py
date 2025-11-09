@@ -115,31 +115,57 @@ if sys.platform == "win32":
             return WAIT_TIMEOUT
         else:
             # wait_all=True: 所有对象都就绪才返回成功
-            for idx in range(0, len(handles), chunk_size):
-                chunk = handles[idx:idx+chunk_size]
+            # ✅ 修复：使用轮询式等待，而非顺序阻塞等待
+            # 避免在某个批次的慢进程上永久阻塞
 
-                # 计算本批次的剩余超时时间
+            # 将句柄分批
+            num_chunks = (len(handles) + chunk_size - 1) // chunk_size
+            chunks = [handles[i:i+chunk_size] for i in range(0, len(handles), chunk_size)]
+            completed_chunks = [False] * num_chunks
+
+            # 轮询式等待，每次用短timeout检查各批次
+            POLL_TIMEOUT_MS = 100  # 100毫秒轮询一次
+            start_time = time.perf_counter()
+
+            while not all(completed_chunks):
+
+                # 检查总超时
                 remaining_timeout = _calc_remaining_timeout()
                 if remaining_timeout == 0 and deadline is not None:
                     return WAIT_TIMEOUT
 
-                # ✅ P0修复#2（BUG #2）: 防御性检查 - 确保_SAVED_WAIT_API已初始化
-                saved_api = _SAVED_WAIT_API
-                if saved_api is None:
-                    raise RuntimeError(
-                        "unlock_processpool未初始化。"
-                        "请在创建ProcessPoolExecutor前调用 unlock_processpool.please()"
-                    )
-                ret = saved_api(chunk, True, remaining_timeout)
+                # 使用短timeout或剩余时间（取最小值）
+                poll_timeout = POLL_TIMEOUT_MS if deadline is None else min(POLL_TIMEOUT_MS, remaining_timeout)
 
-                if ret == WAIT_OBJECT_0:  # 这个批次的所有对象都就绪
-                    continue  # 继续检查下一个批次
-                elif WAIT_ABANDONED_0 <= ret < WAIT_ABANDONED_0 + 64:  # WAIT_ABANDONED_0 到 WAIT_ABANDONED_63
-                    # ✅ P0修复#1（BUG #1）: 调整abandoned索引到全局范围（和wait_all=False保持一致）
-                    return WAIT_ABANDONED_0 + idx + (ret - WAIT_ABANDONED_0)
-                else:
-                    # WAIT_TIMEOUT, WAIT_FAILED, 或其他错误码
-                    return ret
+                # 检查每个未完成的批次
+                for chunk_idx, chunk in enumerate(chunks):
+                    if completed_chunks[chunk_idx]:
+                        continue  # 已完成，跳过
+
+                    # 防御性检查
+                    saved_api = _SAVED_WAIT_API
+                    if saved_api is None:
+                        raise RuntimeError(
+                            "unlock_processpool未初始化。"
+                            "请在创建ProcessPoolExecutor前调用 unlock_processpool.please()"
+                        )
+
+                    # 用短timeout检查这个批次
+                    ret = saved_api(chunk, True, poll_timeout)
+
+                    if ret == WAIT_OBJECT_0:  # 这个批次的所有对象都就绪
+                        completed_chunks[chunk_idx] = True
+                    elif WAIT_ABANDONED_0 <= ret < WAIT_ABANDONED_0 + 64:
+                        # 某个对象被遗弃（进程异常退出）
+                        idx = chunk_idx * chunk_size
+                        return WAIT_ABANDONED_0 + idx + (ret - WAIT_ABANDONED_0)
+                    elif ret == WAIT_TIMEOUT:
+                        # 这个批次还没完成，继续等待
+                        pass
+                    elif ret == WAIT_FAILED:
+                        # 失败
+                        return ret
+                    # 其他返回值：继续检查下一个批次
 
             # 所有批次都成功
             return WAIT_OBJECT_0
@@ -160,6 +186,13 @@ def please():
         - 必须在创建ProcessPoolExecutor或joblib并行任务之前调用
         - 可以安全地多次调用（幂等）
         - 不能在模块重载后调用
+        - 对ProcessPoolExecutor完全支持（可到510进程）
+        - 对multiprocessing.Pool部分支持（建议<60进程，或切换到Executor）
+
+    兼容性说明:
+        - ProcessPoolExecutor: ✅ 完美支持大规模并发
+        - joblib (loky backend): ✅ 完美支持
+        - multiprocessing.Pool: ⚠️ 受系统资源限制，建议<60进程
     """
     if sys.platform != "win32":
         return False
@@ -214,5 +247,42 @@ def please():
     except (ImportError, ModuleNotFoundError, Exception):
         # joblib未安装或配置失败，忽略
         pass
+
+    # 🔧 修复 multiprocessing.Pool 在 > 61 进程时的死锁问题
+    try:
+        from multiprocessing import pool as pool_module
+
+        # 保存原始的 Pool.close 方法
+        if not hasattr(pool_module.Pool, '_original_close_unlocked'):
+            original_close = pool_module.Pool.close
+
+            def _patched_close(self):
+                """
+                修补后的 Pool.close()
+                修复 > 61 进程时的死锁：
+                - 原始问题：_handle_tasks 阻塞在 taskqueue.get()
+                - 解决方案：手动向 taskqueue 发送 None 来唤醒 _handle_tasks
+                """
+                # 调用原始的 close
+                original_close(self)
+
+                # 🔧 关键修复：向 taskqueue 发送 None
+                # _handle_tasks 在 `iter(taskqueue.get, None)` 上阻塞
+                # 当收到 None 时，会向所有 worker 发送退出信号
+                try:
+                    if hasattr(self, '_taskqueue') and self._taskqueue is not None:
+                        self._taskqueue.put(None)
+                except Exception:
+                    # 如果 taskqueue 已关闭或出错，忽略
+                    pass
+
+            # 替换 Pool.close 方法
+            pool_module.Pool._original_close_unlocked = original_close
+            pool_module.Pool.close = _patched_close
+
+            _logger.debug("已修补 multiprocessing.Pool.close() 以支持 > 61 进程")
+    except (ImportError, AttributeError, Exception) as e:
+        # multiprocessing.Pool 不可用或修补失败，忽略
+        _logger.debug(f"无法修补 multiprocessing.Pool: {e}")
 
     return True
