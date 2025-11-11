@@ -279,10 +279,8 @@ def please():
             # 替换 Pool.close 方法
             pool_module.Pool._original_close_unlocked = original_close
             pool_module.Pool.close = _patched_close
-
-            _logger.debug("已修补 multiprocessing.Pool.close() 以支持 > 61 进程")
-    except (ImportError, AttributeError, Exception) as e:
+    except (ImportError, AttributeError, Exception):
         # multiprocessing.Pool 不可用或修补失败，忽略
-        _logger.debug(f"无法修补 multiprocessing.Pool: {e}")
+        pass
 
     return True
