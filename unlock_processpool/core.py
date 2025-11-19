@@ -10,7 +10,7 @@ import math
 import logging
 
 # 核心配置
-_UNLOCKED_MAX_WORKERS = 510  # 总句柄数限制
+_UNLOCKED_MAX_WORKERS = 2048  # 总句柄数限制（提升至2048以满足极高并发）
 _SAVED_WAIT_API = None
 _PLEASE_LOCK = threading.RLock()  # 防止竞态条件的可重入锁
 
@@ -53,6 +53,12 @@ if sys.platform == "win32":
             - 所有批次共享同一个总超时时间
             - 超时时间使用向上取整，确保不会提前超时
             - 线程安全：可以在多线程环境中安全调用
+
+        ⚠️ 关键限制 (Critical Caveat):
+            - 本函数仅适用于 **状态非易失性 (Non-volatile state)** 对象（如进程句柄、Manual-Reset Events）。
+            - **不支持** 对 >64 个 **Auto-Reset Events** 进行原子等待 (`wait_all=True`)。
+            - 原因：无法在用户态模拟内核级的原子性全量检查。分批检查会导致状态在检查间隙被重置（Race Condition）。
+            - 对于进程池（ProcessPool）场景，进程句柄是 Manual-Reset 的，因此是完全安全的。
         """
         # P0修复#2: 防御性检查 - 空句柄列表
         if not handles:
@@ -84,91 +90,127 @@ if sys.platform == "win32":
             # 例如: 0.9ms不会被截断为0ms
             return math.ceil(remaining_sec * 1000)
 
+        # 自适应轮询参数
+        MIN_POLL_INTERVAL = 0.001  # 1ms: 极速响应模式 (Burst)
+        MAX_POLL_INTERVAL = 0.050  # 50ms: 省电模式 (Idle)
+        BACKOFF_FACTOR = 2.0       # 指数退避因子
+
         if not wait_all:
             # wait_all=False: 任何一个对象就绪就返回
-            for idx in range(0, len(handles), chunk_size):
-                chunk = handles[idx:idx+chunk_size]
+            # 修复逻辑：使用自适应轮询模式 (Adaptive Polling)
+            
+            current_poll_interval = MIN_POLL_INTERVAL
 
-                # 计算本批次的剩余超时时间
-                remaining_timeout = _calc_remaining_timeout()
-                if remaining_timeout == 0 and deadline is not None:
-                    return WAIT_TIMEOUT
-
-                # ✅ P0修复#2（BUG #2）: 防御性检查 - 确保_SAVED_WAIT_API已初始化
-                saved_api = _SAVED_WAIT_API
-                if saved_api is None:
-                    raise RuntimeError(
-                        "unlock_processpool未初始化。"
-                        "请在创建ProcessPoolExecutor前调用 unlock_processpool.please()"
-                    )
-                ret = saved_api(chunk, False, remaining_timeout)
-
-                # 处理各种返回值（使用常量替代魔法数字）
-                if WAIT_OBJECT_0 <= ret < WAIT_OBJECT_0 + 64:  # WAIT_OBJECT_0 到 WAIT_OBJECT_63
-                    return idx + ret
-                elif WAIT_ABANDONED_0 <= ret < WAIT_ABANDONED_0 + 64:  # WAIT_ABANDONED_0 到 WAIT_ABANDONED_63
-                    # 保持WAIT_ABANDONED语义，返回全局索引
-                    return WAIT_ABANDONED_0 + idx + (ret - WAIT_ABANDONED_0)
-                elif ret == WAIT_FAILED:
-                    return ret
-                # WAIT_TIMEOUT 继续下一个批次
-            return WAIT_TIMEOUT
-        else:
-            # wait_all=True: 所有对象都就绪才返回成功
-            # ✅ 修复：使用轮询式等待，而非顺序阻塞等待
-            # 避免在某个批次的慢进程上永久阻塞
-
-            # 将句柄分批
-            num_chunks = (len(handles) + chunk_size - 1) // chunk_size
-            chunks = [handles[i:i+chunk_size] for i in range(0, len(handles), chunk_size)]
-            completed_chunks = [False] * num_chunks
-
-            # 轮询式等待，每次用短timeout检查各批次
-            POLL_TIMEOUT_MS = 100  # 100毫秒轮询一次
-            start_time = time.perf_counter()
-
-            while not all(completed_chunks):
-
-                # 检查总超时
-                remaining_timeout = _calc_remaining_timeout()
-                if remaining_timeout == 0 and deadline is not None:
-                    return WAIT_TIMEOUT
-
-                # 使用短timeout或剩余时间（取最小值）
-                poll_timeout = POLL_TIMEOUT_MS if deadline is None else min(POLL_TIMEOUT_MS, remaining_timeout)
-
-                # 检查每个未完成的批次
-                for chunk_idx, chunk in enumerate(chunks):
-                    if completed_chunks[chunk_idx]:
-                        continue  # 已完成，跳过
-
+            while True:
+                # 1. 快速扫描所有批次 (非阻塞检查)
+                for idx in range(0, len(handles), chunk_size):
+                    chunk = handles[idx:idx+chunk_size]
+                    
                     # 防御性检查
                     saved_api = _SAVED_WAIT_API
                     if saved_api is None:
-                        raise RuntimeError(
-                            "unlock_processpool未初始化。"
-                            "请在创建ProcessPoolExecutor前调用 unlock_processpool.please()"
-                        )
+                        raise RuntimeError("unlock_processpool未初始化")
 
-                    # 用短timeout检查这个批次
-                    ret = saved_api(chunk, True, poll_timeout)
+                    # 使用 timeout=0 进行瞬时检查
+                    ret = saved_api(chunk, False, 0)
 
-                    if ret == WAIT_OBJECT_0:  # 这个批次的所有对象都就绪
-                        completed_chunks[chunk_idx] = True
+                    if WAIT_OBJECT_0 <= ret < WAIT_OBJECT_0 + 64:
+                        return idx + ret
                     elif WAIT_ABANDONED_0 <= ret < WAIT_ABANDONED_0 + 64:
-                        # 某个对象被遗弃（进程异常退出）
-                        idx = chunk_idx * chunk_size
                         return WAIT_ABANDONED_0 + idx + (ret - WAIT_ABANDONED_0)
-                    elif ret == WAIT_TIMEOUT:
-                        # 这个批次还没完成，继续等待
-                        pass
                     elif ret == WAIT_FAILED:
-                        # 失败
                         return ret
-                    # 其他返回值：继续检查下一个批次
+                    elif ret == WAIT_TIMEOUT:
+                        pass # 继续检查下一个chunk
+                
+                # 2. 检查总超时
+                remaining_timeout = _calc_remaining_timeout()
+                if remaining_timeout == 0 and deadline is not None:
+                    return WAIT_TIMEOUT
 
-            # 所有批次都成功
-            return WAIT_OBJECT_0
+                # 3. 自适应睡眠
+                sleep_time = current_poll_interval
+                if deadline is not None:
+                    sleep_time = min(current_poll_interval, remaining_timeout / 1000.0)
+                
+                time.sleep(sleep_time)
+
+                # 4. 调整下一次轮询间隔 (指数退避)
+                # 如果没有发现任何活动，增加睡眠时间以节省CPU
+                current_poll_interval = min(current_poll_interval * BACKOFF_FACTOR, MAX_POLL_INTERVAL)
+
+        else:
+            # wait_all=True: 所有对象都就绪才返回成功
+            # 修复逻辑：同样使用自适应轮询模式 (Adaptive Polling)
+            
+            # 将句柄分批
+            num_chunks = (len(handles) + chunk_size - 1) // chunk_size
+            chunks = [handles[i:i+chunk_size] for i in range(0, len(handles), chunk_size)]
+            
+            # 记录每个 chunk 的完成状态
+            chunk_results = [None] * num_chunks
+            
+            current_poll_interval = MIN_POLL_INTERVAL
+
+            while True:
+                all_done = True
+                abandoned_base_index = -1
+                activity_detected = False # 本轮是否有新的chunk完成
+                
+                # 1. 扫描所有未完成的 chunk
+                for i, chunk in enumerate(chunks):
+                    if chunk_results[i] is not None:
+                        continue  # 该 chunk 已完成
+                    
+                    # 防御性检查
+                    saved_api = _SAVED_WAIT_API
+                    if saved_api is None:
+                        raise RuntimeError("unlock_processpool未初始化")
+
+                    # 使用 timeout=0 进行非阻塞检查
+                    ret = saved_api(chunk, True, 0)
+                    
+                    if ret == WAIT_OBJECT_0:
+                        chunk_results[i] = ret
+                        activity_detected = True
+                    elif WAIT_ABANDONED_0 <= ret < WAIT_ABANDONED_0 + 64:
+                        chunk_results[i] = ret
+                        activity_detected = True
+                        if abandoned_base_index == -1:
+                            abandoned_base_index = i * chunk_size + (ret - WAIT_ABANDONED_0)
+                    elif ret == WAIT_FAILED:
+                        return ret
+                    elif ret == WAIT_TIMEOUT:
+                        all_done = False
+                
+                # 2. 检查是否全部完成
+                if all_done:
+                    if abandoned_base_index != -1:
+                        return WAIT_ABANDONED_0 + abandoned_base_index
+                    return WAIT_OBJECT_0
+
+                # 3. 检查总超时
+                remaining_timeout = _calc_remaining_timeout()
+                if remaining_timeout == 0 and deadline is not None:
+                    return WAIT_TIMEOUT
+
+                # 4. 动态调整轮询策略
+                if activity_detected:
+                    # 如果本轮有进展，立即重置为极速模式，因为通常任务是成批结束的
+                    current_poll_interval = MIN_POLL_INTERVAL
+                else:
+                    # 如果无进展，指数退避
+                    current_poll_interval = min(current_poll_interval * BACKOFF_FACTOR, MAX_POLL_INTERVAL)
+
+                # 5. 自适应睡眠
+                sleep_time = current_poll_interval
+                if deadline is not None:
+                    sleep_time = min(current_poll_interval, remaining_timeout / 1000.0)
+                
+                time.sleep(sleep_time)
+
+    # 标记身份，用于模块重载时的识别
+    _hacked_wait._is_unlock_patch = True
 
 def please():
     """
@@ -201,26 +243,41 @@ def please():
 
     # 使用锁保护临界区，防止TOCTOU竞态条件
     with _PLEASE_LOCK:
-        # P0修复#1: 防止模块重载导致无限递归
-        # 检查当前_winapi.WaitForMultipleObjects是否已经是_hacked_wait
         current_api = _winapi.WaitForMultipleObjects
 
+        # 1. 快速通道：完全相同的函数对象（同一次加载内的重复调用）
         if current_api is _hacked_wait:
-            # 已经初始化过了（幂等操作）
-            if _SAVED_WAIT_API is None:
-                # 警告：这可能是模块重载后的状态，但我们无法安全地恢复
-                # 为了向后兼容测试场景，我们不抛出错误，而是记录警告
-                _logger.warning(
-                    "检测到_winapi.WaitForMultipleObjects已被替换，但_SAVED_WAIT_API为None。"
-                    "这可能是模块重载导致的。请避免重载unlock_processpool模块。"
-                )
             _logger.debug("please()已被调用过，幂等操作")
-            # 不做任何修改，直接返回（保持幂等性）
+            return True
+
+        # 2. 智能检测：检查是否是“前世”留下的钩子（模块重载场景）
+        # 使用 getattr 安全获取，防止 AttributeError
+        if getattr(current_api, "_is_unlock_patch", False):
+            _logger.warning("检测到模块重载：正在执行热替换 (Hot-Swap)...")
+            
+            # 关键步骤：从旧钩子中“赎回”原始 API
+            original_api = getattr(current_api, "_original_api", None)
+            
+            if original_api is None:
+                # 防御性编程：如果旧钩子坏了，没带原始API，我们只能报错停止，防止无限递归
+                _logger.error("严重错误：检测到旧补丁但丢失了原始API引用。无法安全继续。")
+                return False
         else:
-            # 首次初始化
-            _SAVED_WAIT_API = current_api
-            _winapi.WaitForMultipleObjects = _hacked_wait
-            _logger.debug("成功替换_winapi.WaitForMultipleObjects")
+            # 3. 初始状态：这是纯净的系统 API
+            original_api = current_api
+
+        # --- 执行挂载 ---
+        
+        # A. 初始化当前模块的全局状态
+        _SAVED_WAIT_API = original_api
+        
+        # B. 将原始 API 绑在身上，作为“传家宝”留给下一次 Reload
+        _hacked_wait._original_api = original_api
+        
+        # C. 替换系统 API
+        _winapi.WaitForMultipleObjects = _hacked_wait
+        
+        _logger.debug(f"成功替换_winapi.WaitForMultipleObjects (Hot-Swap={getattr(current_api, '_is_unlock_patch', False)})")
 
     # 动态修改所有已知限制模块
     modules = [
@@ -279,8 +336,10 @@ def please():
             # 替换 Pool.close 方法
             pool_module.Pool._original_close_unlocked = original_close
             pool_module.Pool.close = _patched_close
-    except (ImportError, AttributeError, Exception):
+
+            _logger.debug("已修补 multiprocessing.Pool.close() 以支持 > 61 进程")
+    except (ImportError, AttributeError, Exception) as e:
         # multiprocessing.Pool 不可用或修补失败，忽略
-        pass
+        _logger.debug(f"无法修补 multiprocessing.Pool: {e}")
 
     return True
